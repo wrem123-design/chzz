@@ -20,15 +20,15 @@
     const LIVE_PATH_REGEX = /\/live\/([^/?#]+)/;
     const SLIDER_SELECTOR = ".slider";
     const LIVE_DETAIL_FLAG = "__chzzkTimeMachineLiveDetail";
+    const LIVE_DETAIL_CHANNEL_FLAG = "__chzzkTimeMachineChannelId";
     const BLOCKING_MODAL_TEXTS = [
         "허용되지 않는 비정상적 접근입니다",
         "타임머신 기능을 이용할 수 있어요",
         "치트키를 구매하면",
     ];
 
-    let timeMachinePlayback = null;
-    let timeMachinePlaybackJson = null;
-    let timeMachinePlaybackPromise = null;
+    let currentChannelId = getChannelIdFromUrl();
+    const playbackCache = new Map();
 
     function getChannelIdFromUrl(url = location.href) {
         return url.match(LIVE_PATH_REGEX)?.[1] ?? null;
@@ -110,16 +110,36 @@
         return normalized;
     }
 
-    function ensureTimeMachinePlayback(channelId = getChannelIdFromUrl()) {
+    function getPlaybackEntry(channelId) {
+        if (!playbackCache.has(channelId)) {
+            playbackCache.set(channelId, {
+                playback: null,
+                promise: null,
+            });
+        }
+
+        return playbackCache.get(channelId);
+    }
+
+    function getCachedPlayback(channelId = currentChannelId) {
+        if (!channelId) {
+            return null;
+        }
+
+        return getPlaybackEntry(channelId).playback;
+    }
+
+    function ensureTimeMachinePlayback(channelId = currentChannelId) {
         if (!channelId) {
             return Promise.resolve();
         }
 
-        if (timeMachinePlaybackPromise) {
-            return timeMachinePlaybackPromise;
+        const entry = getPlaybackEntry(channelId);
+        if (entry.promise) {
+            return entry.promise;
         }
 
-        timeMachinePlaybackPromise = (async () => {
+        entry.promise = (async () => {
             const response = await fetch(getTimeMachineInfoUrl(channelId), {
                 credentials: "include",
             });
@@ -130,14 +150,15 @@
             const data = await response.json();
             const playback = data?.content?.timeMachinePlayback;
             if (playback) {
-                timeMachinePlayback = deepClone(playback);
-                timeMachinePlaybackJson = JSON.stringify(playback);
+                entry.playback = deepClone(playback);
             }
         })().catch((error) => {
             console.warn("[Chzzk Time Machine] 타임머신 정보 로드 실패", error);
+        }).finally(() => {
+            entry.promise = null;
         });
 
-        return timeMachinePlaybackPromise;
+        return entry.promise;
     }
 
     function removeSliderOnLivePage() {
@@ -160,22 +181,23 @@
         });
     }
 
-    function patchLiveDetailPayload(payloadText) {
+    function patchLiveDetailPayload(payloadText, channelId = currentChannelId) {
         try {
             const payload = JSON.parse(payloadText);
             if (!payload?.content) {
                 return null;
             }
 
+            const cachedPlayback = getCachedPlayback(channelId);
             const playback = normalizePlayback(
-                mergePlayback(payload.content.livePlaybackJson, timeMachinePlayback)
+                mergePlayback(payload.content.livePlaybackJson, cachedPlayback)
             );
             if (!playback) {
                 return null;
             }
 
             const playbackJson = JSON.stringify(playback);
-            payload.content.timeMachinePlayback = timeMachinePlayback ?? true;
+            payload.content.timeMachinePlayback = cachedPlayback ?? true;
             payload.content.timeMachinePlaybackJson = playbackJson;
             payload.content.livePlaybackJson = playbackJson;
             payload.content.liveRewindPlaybackJson = playbackJson;
@@ -230,12 +252,45 @@
         });
     }
 
+    function handleRouteChange(url = location.href) {
+        const nextChannelId = getChannelIdFromUrl(String(url));
+        if (nextChannelId === currentChannelId) {
+            return;
+        }
+
+        currentChannelId = nextChannelId;
+        removeBlockingModal();
+        removeSliderOnLivePage();
+        void ensureTimeMachinePlayback(nextChannelId);
+    }
+
+    function installNavigationHook() {
+        const { history } = unsafeWindow;
+        const wrapMethod = (methodName) => {
+            const nativeMethod = history[methodName];
+            history[methodName] = function (...args) {
+                const result = nativeMethod.apply(this, args);
+                queueMicrotask(() => {
+                    handleRouteChange(args[2] ?? location.href);
+                });
+                return result;
+            };
+        };
+
+        wrapMethod("pushState");
+        wrapMethod("replaceState");
+        unsafeWindow.addEventListener("popstate", () => {
+            handleRouteChange();
+        });
+    }
+
     const { XMLHttpRequest: NativeXMLHttpRequest } = unsafeWindow;
     const nativeOpen = NativeXMLHttpRequest.prototype.open;
     const nativeSend = NativeXMLHttpRequest.prototype.send;
 
     NativeXMLHttpRequest.prototype.open = function (method, url, ...rest) {
         this[LIVE_DETAIL_FLAG] = isLiveDetailRequestUrl(url);
+        this[LIVE_DETAIL_CHANNEL_FLAG] = currentChannelId;
 
         if (this[LIVE_DETAIL_FLAG] && !this.__chzzkTimeMachinePatched) {
             this.__chzzkTimeMachinePatched = true;
@@ -245,7 +300,10 @@
                     return;
                 }
 
-                const patchedText = patchLiveDetailPayload(this.responseText);
+                const patchedText = patchLiveDetailPayload(
+                    this.responseText,
+                    this[LIVE_DETAIL_CHANNEL_FLAG]
+                );
                 if (!patchedText) {
                     return;
                 }
@@ -269,14 +327,15 @@
             return nativeSend.apply(this, args);
         }
 
-        ensureTimeMachinePlayback().finally(() => {
+        ensureTimeMachinePlayback(this[LIVE_DETAIL_CHANNEL_FLAG]).finally(() => {
             nativeSend.apply(this, args);
         });
 
         return undefined;
     };
 
+    installNavigationHook();
     removeSliderOnLivePage();
     watchBlockingModal();
-    void ensureTimeMachinePlayback();
+    void ensureTimeMachinePlayback(currentChannelId);
 })();
