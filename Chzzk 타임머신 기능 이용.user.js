@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name Chzzk 타임머신 기능 이용
 // @namespace http://tampermonkey.net/
-// @version 1.1.6
+// @version 1.1.7
 // @description 치지직 라이브에서 버튼으로 타임머신을 시도합니다.
 // @match https://chzzk.naver.com/*
 // @match https://mul.live/*
@@ -18,11 +18,13 @@
     const LIVE_SERVICE_V1_1_BASE_URL = "https://api.chzzk.naver.com/service/v1.1";
     const LIVE_DETAIL_KEYWORD = "/live-detail";
     const LIVE_PLAYBACK_KEYWORD = "/live-playback-json";
+    const TIME_MACHINE_INFO_KEYWORD = "/clip-time-machine-info";
     const LIVE_PATH_REGEX = /\/live\/([^/?#]+)/;
     const CHANNEL_API_PATH_REGEX = /\/channels\/([^/?#]+)/;
     const SLIDER_SELECTOR = ".slider";
     const LIVE_DETAIL_FLAG = "__chzzkTimeMachineLiveDetail";
     const LIVE_PLAYBACK_FLAG = "__chzzkTimeMachineLivePlayback";
+    const TIME_MACHINE_INFO_FLAG = "__chzzkTimeMachineInfo";
     const REQUEST_CHANNEL_FLAG = "__chzzkTimeMachineChannelId";
     const TOGGLE_SESSION_KEY = "__chzzkTimeMachineEnabledChannelId";
     const TOGGLE_POSITION_STORAGE_KEY = "__chzzkTimeMachineTogglePosition";
@@ -44,7 +46,7 @@
         "타임머신 기능을 이용할 수 있어요",
         "치트키를 구매하면",
     ];
-    const LOG_PREFIX = "[Chzzk Time Machine 1.1.6]";
+    const LOG_PREFIX = "[Chzzk Time Machine 1.1.7]";
 
     let currentChannelId = getChannelIdFromUrl();
     const playbackCache = new Map();
@@ -853,6 +855,10 @@
         return hasPathKeyword(url, LIVE_PLAYBACK_KEYWORD);
     }
 
+    function isTimeMachineInfoRequestUrl(url) {
+        return hasPathKeyword(url, TIME_MACHINE_INFO_KEYWORD);
+    }
+
     function deepClone(value) {
         return value ? JSON.parse(JSON.stringify(value)) : value;
     }
@@ -916,7 +922,10 @@
     function getPlaybackEntry(channelId) {
         if (!playbackCache.has(channelId)) {
             playbackCache.set(channelId, {
+                timeMachineInfo: null,
                 timeMachinePlayback: null,
+                timeMachineActive: null,
+                liveOpenDate: null,
                 livePlaybackJson: null,
                 livePlaybackTmp: null,
                 timeMachinePromise: null,
@@ -941,6 +950,37 @@
         }
 
         return getPlaybackEntry(channelId).livePlaybackJson;
+    }
+
+    function getCachedTimeMachineInfo(channelId = currentChannelId) {
+        if (!channelId) {
+            return null;
+        }
+
+        return getPlaybackEntry(channelId).timeMachineInfo;
+    }
+
+    function syncTimeMachineInfoEntry(channelId, content) {
+        if (!channelId || !content || typeof content !== "object") {
+            return;
+        }
+
+        const entry = getPlaybackEntry(channelId);
+        entry.timeMachineInfo = deepClone(content);
+
+        if (typeof content.timeMachineActive === "boolean") {
+            entry.timeMachineActive = content.timeMachineActive;
+        }
+
+        if (content.timeMachinePlayback) {
+            entry.timeMachinePlayback = deepClone(content.timeMachinePlayback);
+        }
+
+        if (content.liveOpenDate) {
+            entry.liveOpenDate = content.liveOpenDate;
+        } else if (content.openDate && !entry.liveOpenDate) {
+            entry.liveOpenDate = content.openDate;
+        }
     }
 
     function hasInjectedPlayback(channelId = currentChannelId) {
@@ -971,10 +1011,7 @@
             }
 
             const data = await response.json();
-            const playback = data?.content?.timeMachinePlayback;
-            if (playback) {
-                entry.timeMachinePlayback = deepClone(playback);
-            }
+            syncTimeMachineInfoEntry(channelId, data?.content);
         })().catch((error) => {
             console.warn(`${LOG_PREFIX} 타임머신 정보 로드 실패`, error);
         }).finally(() => {
@@ -1060,6 +1097,30 @@
         return normalizePlayback(
             mergePlayback(basePlayback, entry.timeMachinePlayback)
         );
+    }
+
+    function buildPatchedTimeMachineInfo(channelId, fallbackContent = null) {
+        const entry = getPlaybackEntry(channelId);
+        const baseContent =
+            (fallbackContent && typeof fallbackContent === "object" ? fallbackContent : null) ??
+            getCachedTimeMachineInfo(channelId) ??
+            {};
+        const patchedContent = deepClone(baseContent);
+        const hasPlayback = hasInjectedPlayback(channelId);
+
+        patchedContent.channelId ??= channelId;
+        patchedContent.timeMachineActive =
+            hasPlayback || patchedContent.timeMachineActive === true;
+
+        if (entry.liveOpenDate && !patchedContent.liveOpenDate) {
+            patchedContent.liveOpenDate = entry.liveOpenDate;
+        }
+
+        if (hasPlayback) {
+            patchedContent.timeMachinePlayback = getCachedTimeMachinePlayback(channelId);
+        }
+
+        return patchedContent;
     }
 
     function patchLiveDetailPayload(payloadText, channelId = currentChannelId) {
@@ -1170,6 +1231,48 @@
             return JSON.stringify(payload);
         } catch (error) {
             console.warn(`${LOG_PREFIX} live-playback-json 응답 변환 실패`, error);
+            return null;
+        }
+    }
+
+    function patchTimeMachineInfoPayload(payloadText, channelId = currentChannelId) {
+        try {
+            if (!isTimeMachineEnabled(channelId)) {
+                return null;
+            }
+
+            const payload = JSON.parse(payloadText);
+            if (!payload?.content) {
+                return null;
+            }
+
+            syncTimeMachineInfoEntry(channelId, payload.content);
+
+            const entry = getPlaybackEntry(channelId);
+            if (!hasInjectedPlayback(channelId) && payload.content.timeMachineActive !== true) {
+                if (!entry.timeMachinePromise) {
+                    disableTimeMachine(channelId, "unsupportedTimeMachineInfo");
+                }
+
+                console.info(`${LOG_PREFIX} time-machine-info patch passthrough`, {
+                    channelId,
+                    reason: "serverInactiveWithoutTimeMachinePlayback",
+                    timeMachineActive: payload.content.timeMachineActive,
+                    hasTimeMachinePlayback: Boolean(payload.content.timeMachinePlayback),
+                });
+                return null;
+            }
+
+            const patchedContent = buildPatchedTimeMachineInfo(channelId, payload.content);
+            if (!patchedContent.timeMachineActive) {
+                return null;
+            }
+
+            payload.content = patchedContent;
+            queueMicrotask(updateToggleButton);
+            return JSON.stringify(payload);
+        } catch (error) {
+            console.warn(`${LOG_PREFIX} time-machine-info 응답 변환 실패`, error);
             return null;
         }
     }
@@ -1302,9 +1405,10 @@
     NativeXMLHttpRequest.prototype.open = function (method, url, ...rest) {
         this[LIVE_DETAIL_FLAG] = isLiveDetailRequestUrl(url);
         this[LIVE_PLAYBACK_FLAG] = isLivePlaybackRequestUrl(url);
+        this[TIME_MACHINE_INFO_FLAG] = isTimeMachineInfoRequestUrl(url);
         this[REQUEST_CHANNEL_FLAG] = getChannelIdFromApiUrl(url) ?? currentChannelId;
 
-        if ((this[LIVE_DETAIL_FLAG] || this[LIVE_PLAYBACK_FLAG]) && !this.__chzzkTimeMachinePatched) {
+        if ((this[LIVE_DETAIL_FLAG] || this[LIVE_PLAYBACK_FLAG] || this[TIME_MACHINE_INFO_FLAG]) && !this.__chzzkTimeMachinePatched) {
             this.__chzzkTimeMachinePatched = true;
 
             this.addEventListener("readystatechange", () => {
@@ -1320,6 +1424,8 @@
                     patchedText = patchLiveDetailPayload(this.responseText, channelId);
                 } else if (this[LIVE_PLAYBACK_FLAG] || isLivePlaybackRequestUrl(responseUrl)) {
                     patchedText = patchLivePlaybackPayload(this.responseText, channelId);
+                } else if (this[TIME_MACHINE_INFO_FLAG] || isTimeMachineInfoRequestUrl(responseUrl)) {
+                    patchedText = patchTimeMachineInfoPayload(this.responseText, channelId);
                 }
 
                 if (patchedText) {
@@ -1332,11 +1438,11 @@
     };
 
     NativeXMLHttpRequest.prototype.send = function (...args) {
-        if (!this[LIVE_DETAIL_FLAG] && !this[LIVE_PLAYBACK_FLAG]) {
+        if (!this[LIVE_DETAIL_FLAG] && !this[LIVE_PLAYBACK_FLAG] && !this[TIME_MACHINE_INFO_FLAG]) {
             return nativeSend.apply(this, args);
         }
 
-        if (this[LIVE_DETAIL_FLAG]) {
+        if (this[LIVE_DETAIL_FLAG] || this[TIME_MACHINE_INFO_FLAG]) {
             void ensureLiveDetailPrerequisites(this[REQUEST_CHANNEL_FLAG]);
         }
 
